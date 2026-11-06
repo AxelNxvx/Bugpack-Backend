@@ -1,18 +1,9 @@
-# Build and Release Folders
-bin-debug/
-bin-release/
-[Oo]bj/
-[Bb]in/
+# Dependencias (Render las instalará solo)
+node_modules/
 
-# Other files and folders
-.settings/
+# Variables de entorno (¡Tus contraseñas del NAS!)
+.env
 
-# Executables
-*.swf
-*.air
-*.ipa
-*.apk
-
-# Project files, i.e. `.project`, `.actionScriptProperties` and `.flexProperties`
-# should NOT be excluded as they contain compiler settings and other important
-# information for Eclipse / Flash Builder.
+# Archivos temporales y de la base de datos local
+storage/
+*.log

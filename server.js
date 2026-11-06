@@ -1,0 +1,160 @@
+import "dotenv/config";
+import express from 'express';
+import cors from 'cors';
+import multer from 'multer';
+import fs from 'fs';
+import path from 'path';
+import crypto from 'crypto';
+import { fileURLToPath } from 'url';
+import AdmZip from 'adm-zip';
+
+import { createNasClient, safeName } from './nas.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const PORT = process.env.PORT || 3001;
+const DIR = path.join(__dirname, 'storage');
+const DB = path.join(DIR, 'index.json');
+
+if (!fs.existsSync(DIR)) fs.mkdirSync(DIR, { recursive: true });
+
+const nasConfig = {
+    baseUrl: process.env.NAS_BASE_URL,
+    user: process.env.NAS_USER,
+    password: process.env.NAS_PASSWORD,
+    path: process.env.NAS_PATH || "/BugPackDev/plaza_folder",
+    insecureTls: process.env.NAS_INSECURE_TLS === "true"
+};
+const nasEnabled = Boolean(nasConfig.baseUrl && nasConfig.user && nasConfig.password);
+const nas = nasEnabled ? createNasClient(nasConfig) : null;
+
+const readDb = () => (fs.existsSync(DB) ? JSON.parse(fs.readFileSync(DB, "utf8")) : []);
+const writeDb = (x) => fs.writeFileSync(DB, JSON.stringify(x, null, 2));
+const updateItem = (id, patch) => {
+    const all = readDb();
+    const i = all.findIndex((r) => r.id === id);
+    if (i < 0) return null;
+    all[i] = { ...all[i], ...patch, nas: { ...(all[i].nas || {}), ...(patch.nas || {}) } };
+    writeDb(all);
+    return all[i];
+};
+
+let queue = Promise.resolve();
+const queued = new Set();
+
+function queueNasUpload(id) {
+    if (!nas || queued.has(id)) return;
+    queued.add(id);
+    queue = queue.then(async () => {
+        const item = readDb().find((r) => r.id === id);
+        if (!item || item.nas?.status === "uploaded") return;
+        
+        const file = path.join(DIR, `${id}.bugpack`);
+        if (!fs.existsSync(file)) return;
+
+        try {
+            const dateStr = new Date(item.createdAt).toISOString().replace(/:/g, '-').replace(/\..+/, '');
+            const safeTitle = (item.title || 'report').normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-zA-Z0-9]/g, "_").substring(0, 30);
+            const remoteName = `bug-report-${dateStr}_${safeTitle}.bugpack`;
+
+            const remotePath = await nas.upload(file, remoteName);
+            
+            updateItem(id, { nas: { status: "uploaded", name: remoteName, path: remotePath, uploadedAt: new Date().toISOString() } });
+            console.log(`[NAS] Subido exitosamente: ${remotePath}`);
+        } catch (e) {
+            updateItem(id, { nas: { status: "error", error: e.message } });
+            console.error(`[NAS] Error subiendo ${id}: ${e.message}`);
+        }
+    }).finally(() => queued.delete(id));
+}
+
+const app = express();
+app.use(cors());
+app.use((req, res, next) => {
+    res.setHeader("Access-Control-Allow-Private-Network", "true");
+    next();
+});
+
+const upload = multer({ dest: path.join(DIR, 'tmp') });
+
+app.get('/api/health', (req, res) => res.json({ ok: true, nas: nasEnabled }));
+
+app.post('/api/reports', upload.single('file'), (req, res) => {
+    if (!req.file) return res.status(400).json({ ok: false, error: 'Falta archivo' });
+    
+    const id = crypto.randomUUID();
+    const filePath = path.join(DIR, `${id}.bugpack`);
+    fs.renameSync(req.file.path, filePath);
+
+    // CÁLCULO DE SEVERIDAD EN EL SERVIDOR
+    let calculatedSeverity = "low";
+    try {
+        const zip = new AdmZip(filePath);
+        const jsonEntry = zip.getEntries().find(e => e.entryName.endsWith('.json'));
+        
+        if (jsonEntry) {
+            const debugData = JSON.parse(jsonEntry.getData().toString('utf8'));
+            const consola = debugData.consoleEvents || [];
+            const red = debugData.networkEvents || [];
+            
+            const errsConsola = consola.filter(e => e.type === 'error').length;
+            const errsRed500 = red.filter(e => e.status >= 500).length;
+            const errsRed400 = red.filter(e => e.status >= 400 && e.status < 500).length;
+            
+            if (errsRed500 > 0 || errsConsola >= 5) calculatedSeverity = "high";
+            else if (errsConsola > 0 || errsRed400 > 0) calculatedSeverity = "medium";
+        }
+    } catch (e) {
+        console.error("Error al calcular severidad:", e);
+    }
+
+    const item = {
+        id,
+        title: req.body.title || req.file.originalname,
+        filename: req.file.originalname,
+        size: req.file.size,
+        createdAt: new Date().toISOString(),
+        url: req.body.url || "",
+        env: req.body.env || "",
+        severity: calculatedSeverity,
+        nas: { status: nas ? "pending" : "disabled" }
+    };
+    
+    writeDb([...readDb(), item]);
+    res.status(201).json(item);
+    
+    queueNasUpload(id);
+});
+
+app.get('/api/reports', (req, res) => {
+    res.json(readDb().sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
+});
+
+app.get("/api/reports/:id/bugpack", async (req, res) => {
+    const id = path.basename(req.params.id);
+    const file = path.join(DIR, `${id}.bugpack`);
+
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+
+    if (fs.existsSync(file)) return res.download(file, `${id}.bugpack`);
+
+    const item = readDb().find((r) => r.id === id);
+    if (nas && item?.nas?.path) {
+        try {
+            const buf = await nas.download(item.nas.path);
+            fs.writeFileSync(file, buf);
+            return res.download(file, item.nas.name || `${id}.bugpack`);
+        } catch (e) {
+            return res.status(500).json({ error: "No se pudo descargar desde el NAS" });
+        }
+    }
+    
+    res.status(404).json({ error: "Archivo no encontrado" });
+});
+
+app.listen(PORT, () => {
+    console.log(`Servidor BugPack en http://127.0.0.1:${PORT}`);
+});
