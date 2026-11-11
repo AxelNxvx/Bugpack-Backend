@@ -78,6 +78,45 @@ app.use((req, res, next) => {
 
 const upload = multer({ dest: path.join(DIR, 'tmp') });
 
+// ============================================================
+// ¡AQUÍ ESTÁ EL PUENTE HACIA RENDER!
+// ============================================================
+app.post('/api/upload-to-render', upload.single('file'), async (req, res) => {
+    if (!req.file) return res.status(400).json({ error: 'Falta archivo' });
+
+    try {
+        console.log("🚀 Reenviando reporte a Render...");
+        
+        const formData = new FormData();
+        const fileBlob = new Blob([fs.readFileSync(req.file.path)], { type: 'application/octet-stream' });
+        
+        formData.append("file", fileBlob, req.file.originalname);
+        formData.append("title", req.body.title || req.file.originalname);
+        formData.append("url", req.body.url || "");
+        formData.append("env", req.body.env || "");
+        formData.append("severity", req.body.severity || "low");
+
+        const response = await fetch("https://bugpack-backend.onrender.com/api/reports", {
+            method: "POST",
+            body: formData
+        });
+
+        if (response.ok) {
+            console.log("✅ Reporte subido exitosamente a Render");
+            // Limpiamos el archivo temporal
+            fs.unlinkSync(req.file.path);
+            res.status(200).json({ ok: true });
+        } else {
+            console.error("❌ Error al subir a Render:", response.status);
+            res.status(response.status).json({ error: "Error en Render" });
+        }
+    } catch (err) {
+        console.error("❌ Fallo del proxy:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+// ============================================================
+
 app.get('/api/health', (req, res) => res.json({ ok: true, nas: nasEnabled }));
 
 app.post('/api/reports', upload.single('file'), (req, res) => {
