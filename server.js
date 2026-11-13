@@ -193,7 +193,44 @@ app.get("/api/reports/:id/bugpack", async (req, res) => {
     
     res.status(404).json({ error: "Archivo no encontrado" });
 });
+async function syncFromNas(){
+    if (!nas) return;
+    console.log("Sincronizando reportes desde el NAS...");
+    try{
+        const remoteFiles = await nas.listFiles();
+        let currentDb = readDb();
+        let addedCount = 0;
+
+        for (const file of remoteFiles){
+            if (!currentDb.some(r => r.nas?.name === file.name)) {
+                const newItem = {
+                    id: crypto.randomUUID(),
+                    title: file.name.replace('.bugpack', ''),
+                    filename: file.name,
+                    size: file.size,
+                    createdAt: file.modifiedAt || new Date().toISOString(),
+                    url: "",
+                    env: "unknown",
+                    severity: "low",
+                    nas: { status: "uploaded", name: file.name, path: file.path }
+                };
+                currentDb.push(newItem);
+                addedCount++;
+            }
+        }
+
+         if (addedCount > 0) {
+            writeDb(currentDb);
+            console.log(`✅ Se recuperaron ${addedCount} reportes desde el NAS.`);
+        } else {
+            console.log("✅ No hay reportes nuevos en el NAS.");
+        }
+    } catch (e) {
+        console.error("❌ Error al sincronizar con el NAS:", e.message);
+    }
+}
 
 app.listen(PORT, () => {
     console.log(`Servidor BugPack en http://127.0.0.1:${PORT}`);
+    syncFromNas();
 });
