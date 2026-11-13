@@ -1,14 +1,9 @@
-// Cliente mínimo de Synology File Station (portado de NasClient.php).
-// Sube / baja archivos del NAS usando la API HTTP (QuickConnect o IP directa).
 import fs from "fs";
 import path from "path";
 import { fetch, FormData, Agent } from "undici";
 
-// Códigos de File Station que significan "la sesión expiró"
 const SESSION_ERRORS = [105, 106, 107, 119];
-// Códigos que significan "la carpeta destino no existe"
 const FOLDER_ERRORS = [400, 401, 408, 1800, 1801, 1802, 1803, 1804, 1805];
-// Códigos que significan "la carpeta ya existe"
 const EXISTS_ERRORS = [414, 418, 189, 419, 1805];
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -108,7 +103,6 @@ export function createNasClient(cfg) {
     throw new Error(`No se pudo crear la carpeta ${fullPath} en el NAS (código ${code ?? r.status}).`);
   }
 
-  /** Sube un archivo local al NAS. Devuelve la ruta remota. */
   async function upload(localPath, remoteName, subPath = "") {
     if (!fs.existsSync(localPath)) throw new Error("No existe el archivo local a subir.");
     const parts = String(subPath).split(/[\\/]+/).map(safeName).filter((p) => p && p !== "." && p !== "..");
@@ -122,7 +116,6 @@ export function createNasClient(cfg) {
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
         const s = await ensureSid();
-        // IMPORTANTE: en File Station el campo "file" debe ir al final del formulario.
         const form = new FormData();
         form.append("api", "SYNO.FileStation.Upload");
         form.append("version", "2");
@@ -153,14 +146,13 @@ export function createNasClient(cfg) {
         lastError = `File Station respondió con error (código ${code}). ${r.raw || ""}`.trim();
       } catch (e) {
         lastError = e.message || String(e);
-        sid = null; // fuerza un login nuevo en el siguiente intento
+        sid = null;
       }
       await sleep(500 * attempt);
     }
     throw new Error(`${lastError} (tras 3 intentos)`);
   }
 
-  /** Descarga un archivo del NAS y devuelve un Buffer. */
   async function download(remotePath) {
     const s = await ensureSid();
     const url =
@@ -177,7 +169,6 @@ export function createNasClient(cfg) {
     if (!res.ok) throw new Error(`NAS respondió HTTP ${res.status}`);
     const buf = Buffer.from(await res.arrayBuffer());
     if (!buf.length) throw new Error("El archivo descargado del NAS está vacío.");
-    // Si File Station contesta con JSON de error en vez del archivo
     if (buf[0] === 0x7b) {
       try {
         const j = JSON.parse(buf.toString("utf8"));
@@ -189,12 +180,39 @@ export function createNasClient(cfg) {
     return buf;
   }
 
-  /** Prueba rápida: ¿se puede entrar al NAS? */
+  // NUEVA FUNCIÓN: Lista los archivos del NAS
+  async function listFiles() {
+    const s = await ensureSid();
+    const url =
+      `${base}/webapi/entry.cgi?` +
+      new URLSearchParams({
+        api: "SYNO.FileStation.List",
+        version: "2",
+        method: "list",
+        folder_path: root,
+        additional: JSON.stringify(["size", "time"]),
+        _sid: s
+      });
+    
+    const r = await json(url);
+    if (!r.body?.success) throw new Error(`No se pudo listar el NAS (código ${r.body?.error?.code || r.status})`);
+    
+    const files = r.body.data?.files || [];
+    return files
+      .filter(f => f.isdir === false) // Solo archivos, no carpetas
+      .map(f => ({
+        name: f.name,
+        path: f.path,
+        size: f.additional?.size || 0,
+        modifiedAt: f.additional?.time?.mtime ? new Date(f.additional.time.mtime * 1000).toISOString() : null
+      }));
+  }
+
   async function ping() {
     sid = null;
     await login();
     return { ok: true, path: root };
   }
 
-  return { upload, download, ping, root };
+  return { upload, download, ping, root, listFiles };
 }
