@@ -193,16 +193,44 @@ app.get("/api/reports/:id/bugpack", async (req, res) => {
     
     res.status(404).json({ error: "Archivo no encontrado" });
 });
-async function syncFromNas(){
+async function syncFromNas() {
     if (!nas) return;
-    console.log("Sincronizando reportes desde el NAS...");
-    try{
-        const remoteFiles = await nas.listFiles();
+    console.log("🔄 Sincronizando reportes desde el NAS...");
+    try {
+        const remoteFiles = await nas.listFiles(); 
         let currentDb = readDb();
         let addedCount = 0;
 
-        for (const file of remoteFiles){
+        for (const file of remoteFiles) {
             if (!currentDb.some(r => r.nas?.name === file.name)) {
+                // Descargamos el archivo para analizarlo
+                let calculatedSeverity = "low";
+                try {
+                    const fileBuffer = await nas.download(file.path);
+                    // Guardamos temporalmente para leerlo con AdmZip
+                    const tempPath = path.join(DIR, `tmp_${file.name}`);
+                    fs.writeFileSync(tempPath, fileBuffer);
+
+                    const zip = new AdmZip(tempPath);
+                    const jsonEntry = zip.getEntries().find(e => e.entryName.endsWith('.json'));
+
+                    if (jsonEntry) {
+                        const debugData = JSON.parse(jsonEntry.getData().toString('utf8'));
+                        const consola = debugData.consoleEvents || [];
+                        const red = debugData.networkEvents || [];
+                        
+                        const errsConsola = consola.filter(e => e.type === 'error').length;
+                        const errsRed500 = red.filter(e => e.status >= 500).length;
+                        const errsRed400 = red.filter(e => e.status >= 400 && e.status < 500).length;
+                        
+                        if (errsRed500 > 0 || errsConsola >= 5) calculatedSeverity = "high";
+                        else if (errsConsola > 0 || errsRed400 > 0) calculatedSeverity = "medium";
+                    }
+                    fs.unlinkSync(tempPath); // Borramos el temporal
+                } catch (e) {
+                    console.error(`Error al analizar ${file.name}:`, e.message);
+                }
+
                 const newItem = {
                     id: crypto.randomUUID(),
                     title: file.name.replace('.bugpack', ''),
@@ -211,7 +239,7 @@ async function syncFromNas(){
                     createdAt: file.modifiedAt || new Date().toISOString(),
                     url: "",
                     env: "unknown",
-                    severity: "low",
+                    severity: calculatedSeverity, // <-- ¡AQUÍ USAMOS LA SEVERIDAD CALCULADA!
                     nas: { status: "uploaded", name: file.name, path: file.path }
                 };
                 currentDb.push(newItem);
@@ -219,7 +247,7 @@ async function syncFromNas(){
             }
         }
 
-         if (addedCount > 0) {
+        if (addedCount > 0) {
             writeDb(currentDb);
             console.log(`✅ Se recuperaron ${addedCount} reportes desde el NAS.`);
         } else {
@@ -229,7 +257,6 @@ async function syncFromNas(){
         console.error("❌ Error al sincronizar con el NAS:", e.message);
     }
 }
-
 app.listen(PORT, () => {
     console.log(`Servidor BugPack en http://127.0.0.1:${PORT}`);
     syncFromNas();
