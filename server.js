@@ -72,6 +72,20 @@ function analyzeBuffer(source) {
     }
 }
 
+// ---------- IDs estables ----------
+// El id sale del nombre del archivo en el NAS, así un reporte conserva el mismo id
+// (y su "Liga Compartible") aunque Render se reinicie y reconstruya el índice.
+const idFromName = (name) => {
+    const h = crypto.createHash('sha1').update(name).digest('hex');
+    return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
+};
+
+function makeRemoteName(title, createdAtIso) {
+    const dateStr = new Date(createdAtIso).toISOString().replace(/:/g, '-').replace(/\..+/, '');
+    const safeTitle = (title || 'report').normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-zA-Z0-9]/g, "_").substring(0, 30);
+    return `bug-report-${dateStr}_${safeTitle}.bugpack`;
+}
+
 // ---------- Cola de subida al NAS ----------
 let queue = Promise.resolve();
 const queued = new Set();
@@ -87,9 +101,7 @@ function queueNasUpload(id) {
         if (!fs.existsSync(file)) return;
 
         try {
-            const dateStr = new Date(item.createdAt).toISOString().replace(/:/g, '-').replace(/\..+/, '');
-            const safeTitle = (item.title || 'report').normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-zA-Z0-9]/g, "_").substring(0, 30);
-            const remoteName = `bug-report-${dateStr}_${safeTitle}.bugpack`;
+            const remoteName = item.nas?.name || makeRemoteName(item.title, item.createdAt);
 
             const remotePath = await nas.upload(file, remoteName);
 
@@ -155,7 +167,10 @@ app.get('/api/health', (req, res) => res.json({ ok: true, nas: nasEnabled }));
 app.post('/api/reports', upload.single('file'), (req, res) => {
     if (!req.file) return res.status(400).json({ ok: false, error: 'Falta archivo' });
 
-    const id = crypto.randomUUID();
+    const createdAt = new Date().toISOString();
+    const title = req.body.title || req.file.originalname;
+    const remoteName = makeRemoteName(title, createdAt);
+    const id = idFromName(remoteName);
     const filePath = path.join(DIR, `${id}.bugpack`);
     fs.renameSync(req.file.path, filePath);
 
@@ -163,15 +178,15 @@ app.post('/api/reports', upload.single('file'), (req, res) => {
 
     const item = {
         id,
-        title: req.body.title || req.file.originalname,
+        title,
         filename: req.file.originalname,
         size: req.file.size,
-        createdAt: new Date().toISOString(),
+        createdAt,
         url: req.body.url || "",
         env: req.body.env || "",
         score,
         severity,
-        nas: { status: nas ? "pending" : "disabled" }
+        nas: { status: nas ? "pending" : "disabled", name: remoteName }
     };
 
     writeDb([...readDb(), item]);
@@ -235,7 +250,7 @@ async function syncFromNas() {
                 if (db.some(r => r.nas?.name === file.name)) continue;
 
                 db.push({
-                    id: crypto.randomUUID(),
+                    id: idFromName(file.name),
                     title: file.name.replace('.bugpack', ''),
                     filename: file.name,
                     size: file.size,
