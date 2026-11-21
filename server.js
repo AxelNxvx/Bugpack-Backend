@@ -216,7 +216,7 @@ async function syncFromNas() {
         const remoteFiles = (await nas.listFiles()).filter(f => /\.bugpack$/i.test(f.name)); 
         const known = new Set(readDb().map(r => r.nas?.name).filter(Boolean));
         const pending = remoteFiles.filter(f => !known.has(f.name));
-        let addedCount = 0;
+        let added = 0;
 
         const worker = async () => {
             while (pending.length) {
