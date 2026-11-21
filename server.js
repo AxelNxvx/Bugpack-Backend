@@ -193,71 +193,73 @@ app.get("/api/reports/:id/bugpack", async (req, res) => {
     
     res.status(404).json({ error: "Archivo no encontrado" });
 });
+function severityFromBuffer(buf) {
+    const zip = new AdmZip(buf);
+    const entry = zip.getEntries().find(e => e.entryName.endsWith('.json'));
+    if (!entry) return "low";
+    const d = JSON.parse(entry.getData().toString('utf8'));
+    const consola = d.consoleEvents || [];
+    const red = d.networkEvents || [];
+    const errsConsola = consola.filter(e => e.type === 'error').length;
+    const errs500 = red.filter(e => e.status >= 500).length;
+    const errs400 = red.filter(e => e.status >= 400 && e.status < 500).length;
+    if (errs500 > 0 || errsConsola >= 5) return "high";
+    if (errsConsola > 0 || errs400 > 0) return "medium";
+    return "low";
+}
+let syncing = false;
 async function syncFromNas() {
-    if (!nas) return;
+    if (!nas || syncing) return;
+    syncing = true;
     console.log("🔄 Sincronizando reportes desde el NAS...");
     try {
-        const remoteFiles = await nas.listFiles(); 
-        let currentDb = readDb();
+        const remoteFiles = (await nas.listFiles()).filter(f => /\.bugpack$/i.test(f.name)); 
+        const known = new Set(readDb().map(r => r.nas?.name).filter(Boolean));
+        const pending = remoteFiles.filter(f => !known.has(f.name));
         let addedCount = 0;
 
-        for (const file of remoteFiles) {
-            if (!currentDb.some(r => r.nas?.name === file.name)) {
-                // Descargamos el archivo para analizarlo
-                let calculatedSeverity = "low";
+        const worker = async () => {
+            while (pending.length) {
+                const file = pending.shift();
+                let severity = "low";
                 try {
-                    const fileBuffer = await nas.download(file.path);
-                    // Guardamos temporalmente para leerlo con AdmZip
-                    const tempPath = path.join(DIR, `tmp_${file.name}`);
-                    fs.writeFileSync(tempPath, fileBuffer);
-
-                    const zip = new AdmZip(tempPath);
-                    const jsonEntry = zip.getEntries().find(e => e.entryName.endsWith('.json'));
-
-                    if (jsonEntry) {
-                        const debugData = JSON.parse(jsonEntry.getData().toString('utf8'));
-                        const consola = debugData.consoleEvents || [];
-                        const red = debugData.networkEvents || [];
-                        
-                        const errsConsola = consola.filter(e => e.type === 'error').length;
-                        const errsRed500 = red.filter(e => e.status >= 500).length;
-                        const errsRed400 = red.filter(e => e.status >= 400 && e.status < 500).length;
-                        
-                        if (errsRed500 > 0 || errsConsola >= 5) calculatedSeverity = "high";
-                        else if (errsConsola > 0 || errsRed400 > 0) calculatedSeverity = "medium";
-                    }
-                    fs.unlinkSync(tempPath); // Borramos el temporal
-                } catch (e) {
+                    severity = severityFromBuffer(await nas.download(file.path));
+                }catch (e) {
                     console.error(`Error al analizar ${file.name}:`, e.message);
                 }
-
-                const newItem = {
-                    id: crypto.randomUUID(),
-                    title: file.name.replace('.bugpack', ''),
-                    filename: file.name,
-                    size: file.size,
-                    createdAt: file.modifiedAt || new Date().toISOString(),
-                    url: "",
-                    env: "unknown",
-                    severity: calculatedSeverity, // <-- ¡AQUÍ USAMOS LA SEVERIDAD CALCULADA!
-                    nas: { status: "uploaded", name: file.name, path: file.path }
-                };
-                currentDb.push(newItem);
-                addedCount++;
-            }
+                const db = readDb();    
+                    // Guardamos temporalmente para leerlo con AdmZip
+                    if (db.some(r => r.nas?.name === file.name)) continue;
+                     db.push({
+                        id: crypto.randomUUID(),
+                        title: file.name.replace('.bugpack', ''),
+                        filename: file.name,
+                        size: file.size,
+                        createdAt: file.modifiedAt || new Date().toISOString(),
+                        url: "",
+                        env: "unknown",
+                        severity,
+                        nas: { status: "uploaded", name: file.name, path: file.path }
+                    });
+                    writeDb(db);
+                    added++;
+                } 
+            };
+            await Promise.all([worker(), worker(), worker()]);
+            console.log(added ? `✅ Se recuperaron ${added} reportes desde el NAS.` : "✅ No hay reportes nuevos en el NAS.");
+        } catch (e) {
+            console.error("Error al sincronizar con el NAS:", e.message);
+        } finally {
+            syncing = false;
         }
-
-        if (addedCount > 0) {
-            writeDb(currentDb);
-            console.log(`✅ Se recuperaron ${addedCount} reportes desde el NAS.`);
-        } else {
-            console.log("✅ No hay reportes nuevos en el NAS.");
-        }
-    } catch (e) {
-        console.error("❌ Error al sincronizar con el NAS:", e.message);
     }
-}
-app.listen(PORT, () => {
-    console.log(`Servidor BugPack en http://127.0.0.1:${PORT}`);
+app.post('/api/sync', (req, res) => {
+    syncFromNas(); 
+    res.json({
+        ok: true,
+    });
+});
+app.listen(PORT, "0.0.0.0",() => {
+    console.log(`Servidor BugPack escuchando en el puerto ${PORT}`);
     syncFromNas();
 });
